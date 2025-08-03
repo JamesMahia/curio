@@ -12,13 +12,26 @@ from pathlib import Path
 
 from shapely import wkt
 
+# Configure Flask to handle CORS properly
+app.config['JSON_SORT_KEYS'] = False
+
 DATA_DIR = "./data"
 
 @app.after_request
 def add_cors_headers(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+@app.route('/processPythonCode', methods=['OPTIONS'])
+@app.route('/exec', methods=['OPTIONS'])
+def handle_preflight():
+    """Handle preflight OPTIONS requests"""
+    response = jsonify({'status': 'ok'})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
 @app.route('/')
@@ -85,6 +98,88 @@ def list_datasets():
 
     return jsonify(files)
 
+@app.route('/processPythonCode', methods=['POST'])
+def process_python_code():
+    """Frontend-compatible endpoint that forwards to exec"""
+    try:
+        app.logger.info("processPythonCode endpoint called")
+        
+        # Get JSON data with better error handling
+        try:
+            data = request.get_json(force=True)
+        except Exception as json_error:
+            app.logger.error(f"JSON parsing error: {json_error}")
+            return jsonify({
+                "errorType": "BadRequest",
+                "message": "Invalid JSON in request body",
+                "details": str(json_error)
+            }), 400
+        
+        if not data:
+            app.logger.error("No JSON data provided")
+            return jsonify({
+                "errorType": "BadRequest", 
+                "message": "No JSON data provided",
+                "details": "Request body is empty or invalid"
+            }), 400
+        
+        app.logger.info(f"Received data keys: {list(data.keys()) if data else 'None'}")
+        
+        code = data.get('code')
+        boxType = data.get('boxType')
+        input_data = data.get('input', {})
+        
+        if not code:
+            return jsonify({
+                "errorType": "BadRequest",
+                "message": "Code parameter is required",
+                "details": "Missing 'code' in request body"
+            }), 400
+        
+        # Transform frontend format to exec format
+        file_path = ""
+        dataType = ""
+        
+        if input_data:
+            if input_data.get('dataType') == 'outputs':
+                file_path = input_data.get('data', [])
+                dataType = 'outputs'
+            elif 'filename' in input_data:
+                file_path = input_data['filename']
+                dataType = input_data['dataType']
+            elif 'path' in input_data:
+                file_path = input_data['path']
+                dataType = input_data['dataType']
+        
+        # Call the existing exec function logic
+        exec_request_data = {
+            'code': code,
+            'file_path': file_path,
+            'boxType': boxType,
+            'dataType': dataType
+        }
+        
+        app.logger.info(f"Forwarding to exec with: {exec_request_data}")
+        
+        # Save original request.json and replace it temporarily
+        original_json = request.json
+        request.json = exec_request_data
+        
+        try:
+            result = exec()
+            app.logger.info("Successfully processed request")
+            return result
+        finally:
+            request.json = original_json
+            
+    except Exception as e:
+        app.logger.error(f"Error in processPythonCode: {str(e)}", exc_info=True)
+        return jsonify({
+            "errorType": "RuntimeError",
+            "message": "An error occurred while processing your code.",
+            "details": str(e)
+        }), 500
+
 @app.route('/exec', methods=['POST'])
 # @cache.cached(make_cache_key=make_key)
 def exec():
@@ -92,59 +187,114 @@ def exec():
     start_time = time.time()
     app.logger.info(f'/exec: Request begin')
 
-    # print(request.json['code'], flush=True)
+    try:
+        if not request.json or request.json.get('code') is None:
+            abort(400, "Code was not included in the post request")
 
-    if(request.json['code'] == None):
-        abort(400, "Code was not included in the post request")
+        # Load default python wrapper code - fix the file path
+        # Try multiple possible locations for python_wrapper.txt
+        possible_paths = [
+            Path(__file__).parent.parent / 'python_wrapper.txt',
+            Path('utk_curio/sandbox/python_wrapper.txt'),
+            Path('sandbox/python_wrapper.txt'),
+            Path('python_wrapper.txt')
+        ]
+        
+        wrapper_path = None
+        for path in possible_paths:
+            if path.exists():
+                wrapper_path = path
+                break
+                
+        if wrapper_path is None:
+            app.logger.error(f"Python wrapper not found. Tried paths: {[str(p) for p in possible_paths]}")
+            app.logger.error(f"Current working directory: {os.getcwd()}")
+            abort(500, "Python wrapper file not found")
+            
+        app.logger.info(f"Using python wrapper from: {wrapper_path}")
+        full_code = wrapper_path.read_text()
 
-    # Load default python wrapper code
-    full_code = open('sandbox/python_wrapper.txt', 'r').read()
+        # Set path to be relative to the place where curio is called
+        original_dir = os.getcwd()
+        launch_dir = os.environ.get("CURIO_LAUNCH_CWD", os.getcwd())
+        app.logger.info(f"Changing directory from {original_dir} to {launch_dir}")
+        
+        try:
+            os.chdir(launch_dir)
+        except Exception as chdir_error:
+            app.logger.warning(f"Could not change to launch directory {launch_dir}: {chdir_error}")
+            # Continue with current directory
 
-    # Set path to be relative to the place where curio is called
-    original_dir = os.getcwd()
-    launch_dir = os.environ.get("CURIO_LAUNCH_CWD", os.getcwd())
-    os.chdir(launch_dir)
+        code = request.json['code']
+        file_path = request.json.get('file_path', '')
+        boxType = request.json.get('boxType', '')
+        dataType = request.json.get('dataType', '')
+        
+        full_code = full_code.replace('{userCode}', str(code))
+        full_code = full_code.replace('{filePath}', str(file_path))
+        full_code = full_code.replace('{boxType}', str(boxType))
+        full_code = full_code.replace('{dataType}', str(dataType))
 
-    code = request.json['code']
-    file_path = request.json['file_path']
-    boxType = request.json['boxType']
-    dataType = request.json['dataType']
-    
-    full_code = full_code.replace('{userCode}', str(code))
-    full_code = full_code.replace('{filePath}', str(file_path))
-    full_code = full_code.replace('{boxType}', str(boxType))
-    full_code = full_code.replace('{dataType}', str(dataType))
+        print("File input:", file_path)
 
-    print("File input:", file_path)
+        COMMON_ERRORS = {
+            "NameError": "Hey! This might be a typo — did you misspell a variable or forget a dot?",
+            "SyntaxError": "Hey! Looks like there's a syntax issue — check for missing commas, parentheses, or colons.",
+            "TypeError": "Hmm, a type mismatch — maybe you tried to do something invalid with a variable?",
+            "ValueError": "Something went wrong with a value — check your inputs.",
+        }
 
-    command = ['python', '-']
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stdout, stderr = process.communicate(full_code)
+        command = ['python', '-']
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate(full_code)
 
-    stdout = [item for item in stdout.split("\n") if item != '']
+        stdout_lines = [item for item in stdout.split("\n") if item != '']
 
-    print("File output", stdout)
+        print("File output", stdout_lines)
 
-    if(len(stdout) > 0):
-        output = json.loads(stdout[-1])
-    else:
-        output = {}
-        output['path'] = ""
-        output['dataType'] = "str"
+        if stderr:
+            first_line = stderr.strip().splitlines()[-1]
+            error_type = first_line.split(":")[0] if ":" in first_line else "RuntimeError"
+            friendly_msg = COMMON_ERRORS.get(error_type, "An unexpected error occurred while running your code.")
+            
+            output = {
+                "errorType": error_type,
+                "message": friendly_msg,
+                "details": stderr.strip()
+            }
+        else:
+            try:
+                output = json.loads(stdout_lines[-1]) if len(stdout_lines) > 0 else {"path": "", "dataType": "str"}
+            except json.JSONDecodeError:
+                output = {"result": stdout_lines[-1] if len(stdout_lines) > 0 else ""}
 
-    jsonOutput = {
-        "stdout": stdout[0:-1], # just get prints, remove output itself
-        "stderr": stderr,
-        "output": output
-    }
+        jsonOutput = {
+            "stdout": stdout_lines[0:-1], # just get prints, remove output itself
+            "stderr": stderr,
+            "output": output
+        }
 
-    # print("----------", jsonOutput, flush=True)
+        app.logger.info(f'/exec: Request end in time: {(time.time() - start_time) / 60} mins')
 
-    app.logger.info(f'/exec: Request end in time: {(time.time() - start_time) / 60} mins')
+        return jsonify(jsonOutput)
+        
+    except Exception as e:
+        app.logger.error(f"Error in exec: {str(e)}")
+        return jsonify({
+            "errorType": "RuntimeError", 
+            "message": "An error occurred while executing your code.",
+            "details": str(e)
+        }), 500
+    finally:
+        try:
+            os.chdir(original_dir)
+        except:
+            pass
 
-    os.chdir(original_dir)
-
-    return jsonify(jsonOutput)
+@app.route('/health', methods=['GET'])
+def health():
+    """Simple health check endpoint"""
+    return jsonify({"status": "ok", "service": "sandbox"})
 
 @app.route('/toLayers', methods=['POST'])
 def toLayers():
