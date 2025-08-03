@@ -12,13 +12,26 @@ from pathlib import Path
 
 from shapely import wkt
 
+# Configure Flask to handle CORS properly
+app.config['JSON_SORT_KEYS'] = False
+
 DATA_DIR = "./data"
 
 @app.after_request
 def add_cors_headers(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+@app.route('/processPythonCode', methods=['OPTIONS'])
+@app.route('/exec', methods=['OPTIONS'])
+def handle_preflight():
+    """Handle preflight OPTIONS requests"""
+    response = jsonify({'status': 'ok'})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
 @app.route('/')
@@ -85,6 +98,58 @@ def list_datasets():
 
     return jsonify(files)
 
+@app.route('/processPythonCode', methods=['POST'])
+def process_python_code():
+    """Frontend-compatible endpoint that forwards to exec"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"errorType": "BadRequest", "message": "No JSON data provided"}), 400
+        
+        code = data.get('code')
+        boxType = data.get('boxType')
+        input_data = data.get('input', {})
+        
+        # Transform frontend format to exec format
+        file_path = ""
+        dataType = ""
+        
+        if input_data:
+            if input_data.get('dataType') == 'outputs':
+                file_path = input_data.get('data', [])
+                dataType = 'outputs'
+            elif 'filename' in input_data:
+                file_path = input_data['filename']
+                dataType = input_data['dataType']
+            elif 'path' in input_data:
+                file_path = input_data['path']
+                dataType = input_data['dataType']
+        
+        # Call the existing exec function logic
+        exec_request_data = {
+            'code': code,
+            'file_path': file_path,
+            'boxType': boxType,
+            'dataType': dataType
+        }
+        
+        # Save original request.json and replace it temporarily
+        original_json = request.json
+        request.json = exec_request_data
+        
+        try:
+            result = exec()
+            return result
+        finally:
+            request.json = original_json
+            
+    except Exception as e:
+        return jsonify({
+            "errorType": "RuntimeError",
+            "message": "An error occurred while processing your code.",
+            "details": str(e)
+        }), 500
+
 @app.route('/exec', methods=['POST'])
 # @cache.cached(make_cache_key=make_key)
 def exec():
@@ -97,8 +162,14 @@ def exec():
     if(request.json['code'] == None):
         abort(400, "Code was not included in the post request")
 
-    # Load default python wrapper code
-    full_code = open('sandbox/python_wrapper.txt', 'r').read()
+    # Load default python wrapper code - fix the file path
+    try:
+        wrapper_path = Path(__file__).parent.parent / 'python_wrapper.txt'
+        if not wrapper_path.exists():
+            wrapper_path = Path('sandbox/python_wrapper.txt')
+        full_code = wrapper_path.read_text()
+    except:
+        full_code = open('sandbox/python_wrapper.txt', 'r').read()
 
     # Set path to be relative to the place where curio is called
     original_dir = os.getcwd()
@@ -117,6 +188,13 @@ def exec():
 
     print("File input:", file_path)
 
+    COMMON_ERRORS = {
+        "NameError": "Hey! This might be a typo — did you misspell a variable or forget a dot?",
+        "SyntaxError": "Hey! Looks like there's a syntax issue — check for missing commas, parentheses, or colons.",
+        "TypeError": "Hmm, a type mismatch — maybe you tried to do something invalid with a variable?",
+        "ValueError": "Something went wrong with a value — check your inputs.",
+    }
+
     command = ['python', '-']
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     stdout, stderr = process.communicate(full_code)
@@ -125,12 +203,26 @@ def exec():
 
     print("File output", stdout)
 
-    if(len(stdout) > 0):
-        output = json.loads(stdout[-1])
+    if stderr:
+        first_line = stderr.strip().splitlines()[-1]
+        error_type = first_line.split(":")[0] if ":" in first_line else "RuntimeError"
+        friendly_msg = COMMON_ERRORS.get(error_type, "An unexpected error occurred while running your code.")
+        
+        output = {
+            "errorType": error_type,
+            "message": friendly_msg,
+            "details": stderr.strip()
+        }
     else:
-        output = {}
-        output['path'] = ""
-        output['dataType'] = "str"
+        if(len(stdout) > 0):
+            try:
+                output = json.loads(stdout[-1])
+            except json.JSONDecodeError:
+                output = {"result": stdout[-1]}
+        else:
+            output = {}
+            output['path'] = ""
+            output['dataType'] = "str"
 
     jsonOutput = {
         "stdout": stdout[0:-1], # just get prints, remove output itself
@@ -145,6 +237,11 @@ def exec():
     os.chdir(original_dir)
 
     return jsonify(jsonOutput)
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Simple health check endpoint"""
+    return jsonify({"status": "ok", "service": "sandbox"})
 
 @app.route('/toLayers', methods=['POST'])
 def toLayers():
