@@ -213,7 +213,7 @@ def start_frontend(force_rebuild=False, no_server=False):
 
         else:
             process = subprocess.Popen(
-                ["python", "-m", "http.server", "8080", "--directory", "dist"],
+                [sys.executable, "-m", "http.server", "8080", "--directory", "dist"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -255,8 +255,11 @@ def prepare_backend_database(force=False):
         log_info(f"[Backend] Using database path: {db_file}", COLOR_BACKEND, 0)
         try:
             env = os.environ.copy()
-            env = {**os.environ, "FLASK_APP": "utk_curio.backend.app:create_app", "PYTHONPATH": project_root + os.pathsep + env.get("PYTHONPATH", "")}
-            subprocess.run(["python", "backend/create_provenance_db.py", os.path.abspath(db_file)], cwd=script_dir, check=True, env=env)
+            home_path = os.path.expanduser("~")
+            local_bin_path = os.path.join(home_path, ".local", "bin")
+            env["PATH"] = local_bin_path + os.pathsep + env.get("PATH", "")
+            env = {**env, "FLASK_APP": "utk_curio.backend.app:create_app", "PYTHONPATH": project_root + os.pathsep + env.get("PYTHONPATH", "")}
+            subprocess.run([sys.executable, "backend/create_provenance_db.py", os.path.abspath(db_file)], cwd=script_dir, check=True, env=env)
 
             subprocess.run(["flask", "db", "upgrade", "--directory", "utk_curio/backend/migrations"], check=True, cwd=project_root, env=env)
             subprocess.run(["flask", "db", "migrate", "-m", "Migration", "--directory", "utk_curio/backend/migrations"], check=True, cwd=project_root, env=env)
@@ -285,7 +288,7 @@ def start_backend(host, port, force_db_init=False, no_server=False):
     env = {**os.environ, "PYTHONPATH": project_root + os.pathsep + env.get("PYTHONPATH", "")}
 
     process = subprocess.Popen(
-        ["python", "-u", "-m", "backend.server"],
+        [sys.executable, "-u", "-m", "backend.server"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -306,7 +309,7 @@ def start_sandbox(host, port):
     env = {**os.environ, "PYTHONPATH": project_root + os.pathsep + env.get("PYTHONPATH", "")}
 
     process = subprocess.Popen(
-        ["python", "-u", "-m", "sandbox.server"],
+        [sys.executable, "-u", "-m", "sandbox.server"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -352,17 +355,10 @@ def get_command_prefix():
 def ensure_utk_installed():
     try:
         import utk
+        log_info("UTK is already installed.", COLOR_RESET, verbose_level=1)
     except ImportError:
-        log_always("Installing bundled utk tarball...")
-        import subprocess, sys, os
-        tarball_path = os.path.join(os.path.dirname(__file__), "sandbox", "utk-0.8.9.tar.gz")
-
-        result = subprocess.run([sys.executable, "-m", "pip", "install", tarball_path], capture_output=True, text=True)
-        log_info(result.stdout.strip(), verbose_level=2)
-        if result.returncode == 0:
-            log_info("Installed utk successfully.", verbose_level=1)
-        else:
-            log_error(f"Failed to install utk:\n{result.stderr.strip()}")
+        log_always("Skipping UTK installation (using manual mode without UTK)...")
+        log_always("UTK is not installed. Some visualization features may be limited, but Curio will work.")
 
 def main():
 
